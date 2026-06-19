@@ -90,4 +90,21 @@ patch("scoped-credentials.js", "scoped-credentials: forward EC2 env vars", [
   },
 ]);
 
+// 5. agentcore-contract.js — make the agent always report tool/command results.
+//    The model tends to run a tool and then go silent; add a global rule to the
+//    AGENTS.md bootstrap instructions. Anchor on the "## Response Formatting"
+//    section header line (array string element).
+patch("agentcore-contract.js", "AGENTS.md: always report results", [
+  {
+    find: '        "## Response Formatting",\n',
+    insert:
+      '        "## Always Report Results",\n' +
+      '        "",\n' +
+      '        "After you run ANY tool or command, always tell the user what happened in your reply — even if it seems minor. Summarize the outcome (what ran, success or failure, and the key part of the output). Never run a command and then stay silent or end your turn without reporting back. If a command failed, say so and include the error.",\n' +
+      '        "",\n',
+    after: false,
+    already: "## Always Report Results",
+  },
+]);
+
 console.log("    All patches applied.");
