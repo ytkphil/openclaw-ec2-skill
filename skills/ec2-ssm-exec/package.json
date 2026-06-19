@@ -1,0 +1,9 @@
+{
+  "name": "ec2-ssm-exec",
+  "version": "1.0.0",
+  "description": "Run shell commands on a target EC2 instance via AWS SSM for OpenClaw",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-ssm": "^3.0.0"
+  }
+}
