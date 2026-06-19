@@ -1,94 +1,116 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — layer the ec2-ssm-exec skill onto the OpenClaw base and deploy.
+# deploy.sh — add the ec2-ssm-exec skill to OpenClaw and deploy via CodeBuild.
 #
-# Run this from your DESKTOP (the machine with the `seoul-golf` AWS profile and
-# Docker). It clones the public base into a temp dir, overlays the skill +
-# patches, builds the ARM64 image, pushes to ECR, updates the AgentCore runtime
-# with the FULL env var set (existing + new EC2 vars), and stops the running
-# session so the next message picks up the new image.
+# No Docker / agentcore CLI needed. Uses the existing CodeBuild project
+# (openclaw-bridge-build) which builds ARM64 in the cloud and pushes to ECR.
 #
-# The public base repo is only ever CLONED here — never committed to.
+# Flow:
+#   1. download the current build source zip from S3 (your latest bridge/)
+#   2. overlay the ec2-ssm-exec skill + patch Dockerfile & scoped-credentials.js
+#   3. re-zip and upload back to S3
+#   4. start CodeBuild with TAG override (default v5)
+#   5. wait for build to succeed
+#   6. update-agent-runtime with the new image + EC2 env vars (FULL env set)
 #
-# Prereqs on the desktop:
-#   - aws CLI + `seoul-golf` profile (account 529296392952, Admin)
-#   - docker (with buildx / ARM64 support)
-#   - git
+# The public base repo is never touched — we build on top of YOUR current
+# source-of-truth zip in S3.
+#
+# Run from the DESKTOP (needs the `seoul-golf` AWS profile). Requires: aws, zip,
+# unzip, node. No Docker.
 #
 # Usage:
-#   bash deploy.sh
+#   bash deploy.sh            # builds tag v5
+#   bash deploy.sh v6         # builds a specific tag
 #
 set -euo pipefail
 
-# ─── Config (your OpenClaw values) ──────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 PROFILE="seoul-golf"
-OC_REGION="ap-northeast-1"                       # OpenClaw runtime region
+OC_REGION="ap-northeast-1"
 ACCOUNT="529296392952"
 RUNTIME_ID="openclaw_agent-OVOYWtHFSU"
 RUNTIME_ARN="arn:aws:bedrock-agentcore:${OC_REGION}:${ACCOUNT}:runtime/${RUNTIME_ID}"
 ECR_REPO="${ACCOUNT}.dkr.ecr.${OC_REGION}.amazonaws.com/bedrock-agentcore-openclaw-bridge"
 EXEC_ROLE_ARN="arn:aws:iam::${ACCOUNT}:role/openclaw-agentcore-execution-role-${OC_REGION}"
+CODEBUILD_PROJECT="openclaw-bridge-build"
+SRC_BUCKET="openclaw-codebuild-src-${ACCOUNT}-${OC_REGION}"
+SRC_KEY="bridge-src.zip"
 
 # Network (from get-agent-runtime)
 SG="sg-068f3fa92952d8f13"
 SUBNET1="subnet-000901931ef2de1d3"
 SUBNET2="subnet-0d42ea9edbfc7e114"
 
-# Target EC2 (the Seoul golf box) — passed to the skill via container env vars
+# Target EC2 (Seoul golf box) — passed to the skill via container env vars
 EC2_TARGET_INSTANCE_ID="i-086f2fe006d505ca2"
 EC2_TARGET_REGION="ap-northeast-2"
 EC2_RUN_AS_USER="ec2-user"
 
-# Public base repo
-BASE_REPO="https://github.com/aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore.git"
-
-# This skill repo (where this script lives)
 SKILL_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# New image tag — bump from current v4
 NEW_TAG="${1:-v5}"
+AWS="aws --profile $PROFILE --region $OC_REGION"
 
-# ─── 0. Sanity checks ────────────────────────────────────────────────────────
+# ─── 0. Prereqs ──────────────────────────────────────────────────────────────
 echo "==> Checking prerequisites..."
-command -v docker >/dev/null || { echo "ERROR: docker not found"; exit 1; }
-command -v git >/dev/null || { echo "ERROR: git not found"; exit 1; }
-aws sts get-caller-identity --profile "$PROFILE" >/dev/null || {
-  echo "ERROR: AWS profile '$PROFILE' not working. Run: ada credentials update --profile $PROFILE --account $ACCOUNT --role Admin --provider isengard --once";
-  exit 1;
-}
-echo "    OK. Deploying image tag: $NEW_TAG"
+for c in aws zip unzip node; do command -v "$c" >/dev/null || { echo "ERROR: $c not found"; exit 1; }; done
+$AWS sts get-caller-identity >/dev/null || { echo "ERROR: profile $PROFILE not working (run ada credentials update ...)"; exit 1; }
+echo "    OK. Target image tag: $NEW_TAG"
 
-# ─── 1. Clone the public base into a temp dir (never modified in git) ────────
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
-echo "==> Cloning base into $BUILD_DIR ..."
-git clone --depth 1 "$BASE_REPO" "$BUILD_DIR/base" -q
-BRIDGE="$BUILD_DIR/base/bridge"
+# ─── 1. Download current build source from S3 ───────────────────────────────
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+echo "==> Downloading current build source (s3://$SRC_BUCKET/$SRC_KEY)..."
+$AWS s3 cp "s3://$SRC_BUCKET/$SRC_KEY" "$WORK/src.zip" >/dev/null
+mkdir -p "$WORK/src"
+( cd "$WORK/src" && unzip -oq ../src.zip )
 
-# ─── 2. Overlay the skill ────────────────────────────────────────────────────
+# sanity: this zip's root IS the bridge dir
+test -f "$WORK/src/Dockerfile" || { echo "ERROR: Dockerfile not at zip root — layout changed"; exit 1; }
+test -f "$WORK/src/buildspec.yml" || { echo "ERROR: buildspec.yml missing from source zip"; exit 1; }
+test -f "$WORK/src/scoped-credentials.js" || { echo "ERROR: scoped-credentials.js missing from source zip"; exit 1; }
+
+# ─── 2. Overlay skill + apply patches ────────────────────────────────────────
 echo "==> Overlaying ec2-ssm-exec skill..."
-cp -r "$SKILL_REPO_DIR/skills/ec2-ssm-exec" "$BRIDGE/skills/ec2-ssm-exec"
+rm -rf "$WORK/src/skills/ec2-ssm-exec"
+cp -r "$SKILL_REPO_DIR/skills/ec2-ssm-exec" "$WORK/src/skills/ec2-ssm-exec"
 
-# ─── 3+4. Patch Dockerfile + scoped-credentials.js via the Node patcher ─────
-# (exact-string, idempotent, fails loudly if base layout changed)
 echo "==> Applying patches (Dockerfile + scoped-credentials.js)..."
-node "$SKILL_REPO_DIR/apply-patches.js" "$BRIDGE"
+node "$SKILL_REPO_DIR/apply-patches.js" "$WORK/src"
 
-# ─── 5. Build ARM64 image ────────────────────────────────────────────────────
-echo "==> Building ARM64 image (this can take several minutes)..."
-docker build --platform linux/arm64 -t "openclaw-bridge:${NEW_TAG}" "$BRIDGE"
+# ─── 3. Re-zip and upload back to S3 ─────────────────────────────────────────
+echo "==> Re-zipping and uploading to S3..."
+( cd "$WORK/src" && zip -rq ../new-src.zip . )
+$AWS s3 cp "$WORK/new-src.zip" "s3://$SRC_BUCKET/$SRC_KEY" >/dev/null
+echo "    Uploaded updated bridge-src.zip"
 
-# ─── 6. Push to ECR ──────────────────────────────────────────────────────────
-echo "==> Pushing to ECR..."
-aws ecr get-login-password --region "$OC_REGION" --profile "$PROFILE" \
-  | docker login --username AWS --password-stdin "${ACCOUNT}.dkr.ecr.${OC_REGION}.amazonaws.com"
-docker tag "openclaw-bridge:${NEW_TAG}" "${ECR_REPO}:${NEW_TAG}"
-docker push "${ECR_REPO}:${NEW_TAG}"
+# ─── 4. Start CodeBuild (ARM64, cloud) with TAG override ─────────────────────
+echo "==> Starting CodeBuild ($CODEBUILD_PROJECT, TAG=$NEW_TAG)..."
+BUILD_ID=$($AWS codebuild start-build \
+  --project-name "$CODEBUILD_PROJECT" \
+  --environment-variables-override "name=TAG,value=${NEW_TAG},type=PLAINTEXT" \
+  --query "build.id" --output text)
+echo "    Build: $BUILD_ID"
 
-# ─── 7. Update the AgentCore runtime (FULL REPLACE of env vars) ──────────────
+# ─── 5. Wait for build ───────────────────────────────────────────────────────
+echo "==> Waiting for build to finish (this can take several minutes)..."
+while true; do
+  PHASE=$($AWS codebuild batch-get-builds --ids "$BUILD_ID" --query "builds[0].currentPhase" --output text)
+  STATUS=$($AWS codebuild batch-get-builds --ids "$BUILD_ID" --query "builds[0].buildStatus" --output text)
+  echo "    phase=$PHASE status=$STATUS"
+  [ "$STATUS" = "SUCCEEDED" ] && break
+  if [ "$STATUS" != "IN_PROGRESS" ]; then
+    echo "ERROR: build ended with status $STATUS. Logs:"
+    echo "  aws codebuild batch-get-builds --ids $BUILD_ID --profile $PROFILE --region $OC_REGION --query 'builds[0].logs.deepLink' --output text"
+    exit 1
+  fi
+  sleep 15
+done
+echo "    Build SUCCEEDED."
+
+# ─── 6. Update the AgentCore runtime (FULL REPLACE of env vars) ──────────────
 echo "==> Updating AgentCore runtime to ${NEW_TAG}..."
-aws bedrock-agentcore-control update-agent-runtime \
-  --region "$OC_REGION" --profile "$PROFILE" \
+$AWS bedrock-agentcore-control update-agent-runtime \
   --agent-runtime-id "$RUNTIME_ID" \
   --role-arn "$EXEC_ROLE_ARN" \
   --agent-runtime-artifact "{\"containerConfiguration\":{\"containerUri\":\"${ECR_REPO}:${NEW_TAG}\"}}" \
@@ -118,28 +140,22 @@ aws bedrock-agentcore-control update-agent-runtime \
     \"EC2_TARGET_INSTANCE_ID\":\"${EC2_TARGET_INSTANCE_ID}\",
     \"EC2_TARGET_REGION\":\"${EC2_TARGET_REGION}\",
     \"EC2_RUN_AS_USER\":\"${EC2_RUN_AS_USER}\"
-  }"
+  }" >/dev/null
 
-# ─── 8. Wait for runtime update, then stop sessions ──────────────────────────
 echo "==> Waiting for runtime to become READY..."
 for i in $(seq 1 30); do
-  STATUS=$(aws bedrock-agentcore-control get-agent-runtime --region "$OC_REGION" --profile "$PROFILE" \
-    --agent-runtime-id "$RUNTIME_ID" --query status --output text)
-  echo "    status: $STATUS"
-  [ "$STATUS" = "READY" ] && break
+  ST=$($AWS bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$RUNTIME_ID" --query status --output text)
+  echo "    status: $ST"
+  [ "$ST" = "READY" ] && break
   sleep 10
 done
 
 echo ""
-echo "==> Done. New image ${NEW_TAG} deployed."
+echo "==> Done. Image ${NEW_TAG} built and runtime updated."
 echo ""
-echo "Next message from the bot will spin up a NEW session on the new image"
-echo "(per-user idle termination). If you want to force it immediately, stop"
-echo "the active session:"
-echo ""
-echo "  # find session id from DynamoDB, then:"
-echo "  aws bedrock-agentcore stop-runtime-session \\"
-echo "    --agent-runtime-arn \"$RUNTIME_ARN\" \\"
+echo "The next message to the bot starts a NEW session on the new image."
+echo "To force it now, stop the active session (find sessionId in DynamoDB):"
+echo "  aws bedrock-agentcore stop-runtime-session --agent-runtime-arn \"$RUNTIME_ARN\" \\"
 echo "    --runtime-session-id \"<sessionId>\" --region $OC_REGION --profile $PROFILE"
 echo ""
-echo "Then in Telegram, ask the bot:  \"내 골프 크론잡 보여줘\""
+echo "Then in Telegram:  \"내 골프 크론잡 보여줘\""

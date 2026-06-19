@@ -30,10 +30,31 @@ skills/ec2-ssm-exec/
 The target host is read from these env vars, never from agent input — so the
 agent cannot pivot to another instance even under prompt injection.
 
-## Deploying onto the OpenClaw base
+## Deploying (the easy way): `bash deploy.sh`
+
+`deploy.sh` does the whole thing with no Docker and no agentcore CLI — it uses
+the existing `openclaw-bridge-build` CodeBuild project (ARM64, cloud) that your
+OpenClaw already builds with. Run it from the desktop with the `seoul-golf`
+profile:
+
+```bash
+bash deploy.sh          # builds & deploys image tag v5
+```
+
+It: downloads your current `bridge-src.zip` from S3 → overlays this skill +
+patches Dockerfile/scoped-credentials → re-zips & uploads → starts CodeBuild →
+waits → `update-agent-runtime` with the full env set plus the EC2 target vars.
+The public base repo is never touched; the build source-of-truth is your S3 zip.
+
+After it finishes, the next message to the bot starts a fresh session on the new
+image (or stop the active session to force it — the script prints how).
+
+---
+
+## Manual steps (reference)
 
 These steps layer the skill onto a *build* of the public base without committing
-to the base repo. Run them where the base repo is checked out.
+to the base repo. `deploy.sh` automates all of this.
 
 ### 1. IAM — let the agent's execution role reach the instance via SSM
 
