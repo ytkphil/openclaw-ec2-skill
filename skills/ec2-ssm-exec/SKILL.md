@@ -122,9 +122,17 @@ python3.11 ~/golf/hansung_reserve.py --slots 20260622:0700 --dry-run            
 Date format is always `YYYYMMDD`, time `HHMM`. Infer the club from context;
 if ambiguous, ask. Confirm date/time/club before any real booking.
 
+"부킹/예약 신청한 거 있어?" means **what's registered in cron** (book / lot /
+hansung_book entries) — you do NOT need to log into the club sites. Filter
+`crontab -l` by club to answer. Yeoju scripts: `book`, `weekend_lot.py`/`lot`,
+`upgrade`, `grab`. Hansung scripts: `hansung_book`, `hansung_reserve`,
+`hansung_grab`. Present each as: date, time, type (선착순/추첨/취소잡기), schedule.
+
 | User says (Korean) | Command |
 |---|---|
 | "골프 크론 뭐 있어 / 크론잡 보여줘" | `crontab -l` |
+| "여주 부킹 신청한 거 있어? / 여주 예약 뭐 걸어놨어?" | `crontab -l \| grep -Ei 'yeoju\|weekend_lot\|/book\|/lot\|/upgrade\|/grab'` — then summarize the Yeoju entries (ignore Hansung ones) |
+| "한성 부킹 신청한 거 있어? / 한성 예약 뭐 걸어놨어?" | `crontab -l \| grep -Ei 'hansung'` — then summarize the Hansung entries |
 | "여주 7월3일 주중 7시 예약해줘" | `~/golf/book now 20260703:0700` (confirm first) |
 | "여주 7월3일 예약 크론 걸어줘" | `~/golf/book 20260703:0700` |
 | "여주 예약 테스트해봐" | `~/golf/book dry 20260703:0700` |
