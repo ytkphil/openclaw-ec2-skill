@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+/**
+ * apply-patches.js <bridgeDir>
+ *
+ * Layers the ec2-ssm-exec changes onto a checkout of the OpenClaw base bridge/
+ * directory: adds @aws-sdk/client-ssm to the Dockerfile npm install list, adds
+ * a COPY for the skill, and adds SSM actions to the scoped-credentials session
+ * policy. Idempotent — running twice is a no-op. Uses exact string anchors
+ * (not regex) so `@` and comment lines can't trip it up.
+ *
+ * Exits non-zero if any anchor is missing (base layout changed) so the build
+ * fails loudly instead of silently shipping an unpatched image.
+ */
+const fs = require("fs");
+const path = require("path");
+
+const bridge = process.argv[2];
+if (!bridge) {
+  console.error("Usage: node apply-patches.js <bridgeDir>");
+  process.exit(1);
+}
+
+function patch(file, label, edits) {
+  const p = path.join(bridge, file);
+  let src = fs.readFileSync(p, "utf8");
+  for (const { find, insert, after, already } of edits) {
+    if (src.includes(already)) {
+      console.log(`    [skip] ${label}: already patched`);
+      continue;
+    }
+    if (!src.includes(find)) {
+      console.error(`ERROR: ${label}: anchor not found:\n${find}`);
+      process.exit(1);
+    }
+    src = after
+      ? src.replace(find, find + insert)
+      : src.replace(find, insert + find);
+    console.log(`    [ok]   ${label}`);
+  }
+  fs.writeFileSync(p, src);
+}
+
+// 1. Dockerfile — add @aws-sdk/client-ssm after @aws-sdk/client-sts in the
+//    npm install list.
+patch("Dockerfile", "Dockerfile: npm @aws-sdk/client-ssm", [
+  {
+    find: "                @aws-sdk/client-sts \\\n",
+    insert: "                @aws-sdk/client-ssm \\\n",
+    after: true,
+    already: "@aws-sdk/client-ssm",
+  },
+]);
+
+// 2. Dockerfile — COPY the skill after the agentcore-browser skill copy.
+patch("Dockerfile", "Dockerfile: COPY ec2-ssm-exec", [
+  {
+    find:
+      "COPY skills/agentcore-browser /skills/agentcore-browser\nRUN chmod +x /skills/agentcore-browser/*.js\n",
+    insert:
+      "\n# EC2 SSM command-exec skill\nCOPY skills/ec2-ssm-exec /skills/ec2-ssm-exec\nRUN chmod +x /skills/ec2-ssm-exec/*.js\n",
+    after: true,
+    already: "skills/ec2-ssm-exec",
+  },
+]);
+
+// 3. scoped-credentials.js — add SSM actions to the session policy. Anchor on
+//    the exact CODE line (with leading spaces + trailing comma) so the
+//    docstring mention of iam:PassRole is never matched.
+patch("scoped-credentials.js", "scoped-credentials: SSM actions", [
+  {
+    find: '          "iam:PassRole",\n',
+    insert:
+      '          "ssm:SendCommand", "ssm:StartSession", "ssm:GetCommandInvocation", "ssm:DescribeInstanceInformation",\n',
+    after: true,
+    already: "ssm:SendCommand",
+  },
+]);
+
+console.log("    All patches applied.");
