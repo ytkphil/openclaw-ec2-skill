@@ -76,4 +76,18 @@ patch("scoped-credentials.js", "scoped-credentials: SSM actions", [
   },
 ]);
 
+// 4. scoped-credentials.js — forward the EC2 target env vars to the OpenClaw
+//    child process. buildOpenClawEnv only copies keys in FORWARDED_ENV_KEYS,
+//    so the ec2-ssm-exec skill can't see EC2_TARGET_* unless we add them here.
+//    Anchor on the last entry of the array.
+patch("scoped-credentials.js", "scoped-credentials: forward EC2 env vars", [
+  {
+    find: '  "INTERNAL_USER_ID",\n',
+    insert:
+      '  // ec2-ssm-exec skill — target instance for SSM command execution\n  "EC2_TARGET_INSTANCE_ID",\n  "EC2_TARGET_REGION",\n  "EC2_RUN_AS_USER",\n',
+    after: true,
+    already: "EC2_TARGET_INSTANCE_ID",
+  },
+]);
+
 console.log("    All patches applied.");
